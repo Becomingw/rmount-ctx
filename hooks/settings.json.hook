@@ -1,0 +1,9 @@
+{
+  "matcher": "cwd matches ~/remote_projects/*",
+  "hooks": [
+    {
+      "type": "command",
+      "command": "bash -c 'if [[ $PWD/ == $HOME/remote_projects/*/ ]]; then name=$(basename \"$PWD\"); $HOME/bin/rmount-ctx refresh \"$name\" &>/dev/null & fi'"
+    }
+  ]
+}

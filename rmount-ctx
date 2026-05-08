@@ -1,0 +1,690 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# rmount-ctx: Remote mount with context injection into CLAUDE.md/AGENTS.md
+# Uses rclone serve webdav over an SSH tunnel, mounted by native macOS WebDAV.
+# Usage:
+#   rmount-ctx mount <host> <remote-path> [name]
+#   rmount-ctx unmount <name>
+#   rmount-ctx refresh <name>
+#   rmount-ctx list
+
+BASE_DIR="$HOME/remote_projects"
+CACHE_DIR="$HOME/.cache/rmount-ctx"
+PORT_BASE=10000
+MARKER_BEGIN="<!-- BEGIN REMOTE-MOUNT CONTEXT (auto-generated) -->"
+MARKER_END="<!-- END REMOTE-MOUNT CONTEXT -->"
+TIMESTAMP="$(date '+%Y-%m-%d %H:%M:%S')"
+
+# ─────────────────────────────────────────────────────────────
+# Utilities
+# ─────────────────────────────────────────────────────────────
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+warn() { echo "WARN: $*" >&2; }
+
+_cache_value() {
+  local cache_file="$1" key="$2"
+  [ -f "$cache_file" ] || return 0
+  grep "^${key}=" "$cache_file" 2>/dev/null | tail -1 | cut -d= -f2- || true
+}
+
+_is_mounted() {
+  local mount_point="$1"
+  mount 2>/dev/null | grep -qF "$mount_point"
+}
+
+_pid_listening_on_port() {
+  local port="$1"
+  command -v lsof &>/dev/null || return 0
+  lsof -nP -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null | head -1 || true
+}
+
+_wait_for_port() {
+  local port="$1" label="$2"
+  local i
+  for i in {1..50}; do
+    if [ -n "$(_pid_listening_on_port "$port")" ]; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+# macOS has no `timeout` — detect and use gtimeout or plain ssh
+if command -v timeout &>/dev/null; then
+  _timeout_cmd() { timeout 5 "$@"; }
+elif command -v gtimeout &>/dev/null; then
+  _timeout_cmd() { gtimeout 5 "$@"; }
+else
+  _timeout_cmd() { "$@"; }
+fi
+
+ssh_cmd() {
+  local host="$1" remote_cmd="$2"
+  _timeout_cmd ssh -o ConnectTimeout=5 -o BatchMode=yes "$host" "$remote_cmd" 2>/dev/null || echo ""
+}
+
+# ─────────────────────────────────────────────────────────────
+# SSH config parsing
+# ─────────────────────────────────────────────────────────────
+
+get_ssh_config() {
+  local host="$1" key="$2"
+  ssh -G "$host" 2>/dev/null | grep "^$key " | head -1 | awk '{print $2}' || echo ""
+}
+
+# ─────────────────────────────────────────────────────────────
+# Garbage Collection
+# ─────────────────────────────────────────────────────────────
+
+gc() {
+  if [ ! -d "$CACHE_DIR" ]; then return 0; fi
+  for json_file in "$CACHE_DIR"/*.json; do
+    [ -f "$json_file" ] || continue
+    local name
+    name=$(basename "$json_file" .json)
+    local mount_point="$BASE_DIR/$name"
+    if ! _is_mounted "$mount_point"; then
+      _stop_services_for "$name"
+      rm -f "$json_file"
+      if [ -d "$mount_point" ]; then
+        for f in "$mount_point/CLAUDE.md" "$mount_point/AGENTS.md"; do
+          [ -f "$f" ] && remove_marker_block "$f"
+        done
+      fi
+      echo "[gc] cleaned stale: $name"
+    fi
+  done
+}
+
+# ─────────────────────────────────────────────────────────────
+# Remote Info Collection via SSH
+# ─────────────────────────────────────────────────────────────
+
+collect_remote_info() {
+  local host="$1" remote_path="$2"
+  local cpu="" ram_total="" ram_avail="" gpu_info="" disk_info=""
+  local gpu_count=0 gpu_detail_block="" tmux_detail=""
+
+  cpu=$(ssh_cmd "$host" "lscpu | grep -E 'Model name|^CPU\\(s\\):' | head -2")
+  ram_total=$(ssh_cmd "$host" "free -g | awk '/Mem:/{print \$2}'")
+  ram_avail=$(ssh_cmd "$host" "free -g | awk '/Mem:/{print \$7}'")
+
+  gpu_info=$(ssh_cmd "$host" "nvidia-smi --query-gpu=name,memory.total,utilization.gpu,memory.used --format=csv,noheader,nounits 2>/dev/null")
+
+  if [ -n "$gpu_info" ]; then
+    local i=0
+    gpu_detail_block=""
+    while IFS=',' read -r gpu_name gpu_mem_total gpu_util gpu_mem_used; do
+      gpu_name=$(echo "$gpu_name" | xargs)
+      gpu_mem_total=$(echo "$gpu_mem_total" | xargs)
+      gpu_util=$(echo "$gpu_util" | xargs)
+      gpu_mem_used=$(echo "$gpu_mem_used" | xargs)
+      local free_tag=""
+      if [ -n "$gpu_util" ] && [ "$gpu_util" != "[Not" ]; then
+        if [ "$(echo "$gpu_util < 10" | bc 2>/dev/null || echo 0)" = "1" ]; then
+          free_tag=" [(free)]"
+        fi
+      fi
+      gpu_detail_block+="  - GPU $i: ${gpu_util}% utilized, ${gpu_mem_used}GB/${gpu_mem_total}GB VRAM${free_tag}
+"
+      i=$((i + 1))
+      gpu_count=$i
+    done <<< "$gpu_info"
+  fi
+
+  disk_info=$(ssh_cmd "$host" "df -h $remote_path | tail -1")
+
+  # tmux sessions
+  local tmux_sessions
+  tmux_sessions=$(ssh_cmd "$host" "tmux list-sessions -F '#{session_name}: #{session_windows} windows [#{session_attached}]' 2>/dev/null")
+  if [ -n "$tmux_sessions" ]; then
+    tmux_detail=""
+    while IFS= read -r line; do
+      local sess_name
+      sess_name=$(echo "$line" | cut -d: -f1)
+      local active_cmd
+      active_cmd=$(ssh_cmd "$host" "tmux list-panes -t '$sess_name' -F '#{pane_current_command}' 2>/dev/null | head -1")
+      tmux_detail+="${line}  → ${active_cmd:-?}
+"
+    done <<< "$tmux_sessions"
+  else
+    tmux_detail="(no tmux sessions)"
+  fi
+
+  cat <<INNEREOF
+cpu=$cpu
+ram_total=$ram_total
+ram_avail=$ram_avail
+gpu_count=$gpu_count
+gpu_detail_block=$gpu_detail_block
+disk_info=$disk_info
+tmux_detail=$tmux_detail
+INNEREOF
+}
+
+# ─────────────────────────────────────────────────────────────
+# Context Block Generation
+# ─────────────────────────────────────────────────────────────
+
+generate_context_block() {
+  local name="$1" host="$2" remote_path="$3"
+  local cache_file="$CACHE_DIR/$name.json"
+  local cpu="" ram_total="" ram_avail="" gpu_count=0 gpu_detail_block="" disk_info="" tmux_detail=""
+
+  if [ -f "$cache_file" ]; then
+    local raw
+    raw=$(cat "$cache_file")
+    cpu=$(echo "$raw" | grep '^cpu=' | cut -d= -f2-)
+    ram_total=$(echo "$raw" | grep '^ram_total=' | cut -d= -f2-)
+    ram_avail=$(echo "$raw" | grep '^ram_avail=' | cut -d= -f2-)
+    gpu_count=$(echo "$raw" | grep '^gpu_count=' | cut -d= -f2-)
+    gpu_detail_block=$(echo "$raw" | grep '^gpu_detail_block=' | cut -d= -f2-)
+    disk_info=$(echo "$raw" | grep '^disk_info=' | cut -d= -f2-)
+    tmux_detail=$(echo "$raw" | grep '^tmux_detail=' | cut -d= -f2-)
+  fi
+
+  local disk_line=""
+  if [ -n "$disk_info" ]; then
+    local d_size d_used d_pct d_mount
+    d_size=$(echo "$disk_info" | awk '{print $2}')
+    d_used=$(echo "$disk_info" | awk '{print $3}')
+    d_pct=$(echo "$disk_info" | awk '{print $5}')
+    d_mount=$(echo "$disk_info" | awk '{print $6}')
+    disk_line="- Disk: ${d_mount} ${d_used}B/${d_size}B (${d_pct})"
+  fi
+
+  local gpu_line=""
+  if [ "$gpu_count" -gt 0 ]; then
+    gpu_line="- GPU: ${gpu_count}× GPU (see detail below)"
+  fi
+
+  cat <<BLOCK
+$MARKER_BEGIN
+## Remote Mount: $name
+
+- **Local path:** $BASE_DIR/$name
+- **Remote host:** $host  →  $host:$remote_path
+- **Last refreshed:** $TIMESTAMP
+
+### Path Translation
+\`\`\`
+Local:  $BASE_DIR/$name/<file>
+Remote: $host:$remote_path/<file>
+Exec:   ssh $host 'cd $remote_path && <cmd>'
+\`\`\`
+
+### Hardware
+- CPU: $cpu
+- RAM: ${ram_total}GB (${ram_avail}GB available)
+$gpu_line
+$gpu_detail_block$disk_line
+
+### tmux Sessions
+\`\`\`
+$tmux_detail\`\`\`
+
+### Rules
+- ✅ Edit/read/write files: local operations OK
+- ❌ Do NOT run python/pip/make etc. locally
+- ❌ Do NOT do heavy small-file IO (npm install, git clone) locally
+- ✅ Execute code: ssh $host 'cd $remote_path && ...'
+- ✅ View live output: ssh -t $host 'tmux attach -t <session>'
+$MARKER_END
+BLOCK
+}
+
+# ─────────────────────────────────────────────────────────────
+# Marker-based injection / removal
+# ─────────────────────────────────────────────────────────────
+
+remove_marker_block() {
+  local file="$1"
+  [ -f "$file" ] || return 0
+  local tmp
+  tmp=$(mktemp)
+  local in_block=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [ "$line" = "$MARKER_BEGIN" ]; then
+      in_block=1; continue
+    elif [ "$line" = "$MARKER_END" ]; then
+      in_block=0; continue
+    fi
+    [ $in_block -eq 0 ] && echo "$line" >> "$tmp"
+  done < "$file"
+  if [ ! -s "$tmp" ]; then
+    rm -f "$tmp" "$file"
+  else
+    mv "$tmp" "$file"
+  fi
+}
+
+inject_context() {
+  local file="$1" context="$2"
+  mkdir -p "$(dirname "$file")"
+  if [ -f "$file" ] && grep -qF "$MARKER_BEGIN" "$file" 2>/dev/null; then
+    local tmp
+    tmp=$(mktemp)
+    local in_block=0
+    while IFS= read -r line || [ -n "$line" ]; do
+      if [ "$line" = "$MARKER_BEGIN" ]; then
+        in_block=1
+        echo "$context" >> "$tmp"
+        continue
+      elif [ "$line" = "$MARKER_END" ]; then
+        in_block=0; continue
+      fi
+      [ $in_block -eq 0 ] && echo "$line" >> "$tmp"
+    done < "$file"
+    mv "$tmp" "$file"
+  else
+    if [ -f "$file" ]; then
+      echo "" >> "$file"
+      echo "$context" >> "$file"
+    else
+      echo "$context" > "$file"
+    fi
+  fi
+}
+
+add_to_git_exclude() {
+  local git_dir="$1/.git"
+  [ -d "$git_dir" ] || return 0
+  local exclude_file="$git_dir/info/exclude"
+  mkdir -p "$(dirname "$exclude_file")"
+  for f in CLAUDE.md AGENTS.md; do
+    grep -qxF "$f" "$exclude_file" 2>/dev/null || echo "$f" >> "$exclude_file"
+  done
+}
+
+remove_from_git_exclude() {
+  local git_dir="$1/.git"
+  [ -d "$git_dir" ] || return 0
+  local exclude_file="$git_dir/info/exclude"
+  [ -f "$exclude_file" ] || return 0
+  for f in CLAUDE.md AGENTS.md; do
+    if grep -qxF "$f" "$exclude_file" 2>/dev/null; then
+      local tmp
+      tmp=$(mktemp)
+      grep -vxF "$f" "$exclude_file" > "$tmp" || true
+      mv "$tmp" "$exclude_file"
+    fi
+  done
+}
+
+# ─────────────────────────────────────────────────────────────
+# WebDAV mount backend
+# ─────────────────────────────────────────────────────────────
+
+_find_rclone_binary() {
+  local candidate
+  for candidate in /tmp/rclone-v*/rclone "$HOME/bin/rclone" /opt/homebrew/bin/rclone /usr/local/bin/rclone; do
+    if [ -x "$candidate" ]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  command -v rclone 2>/dev/null || return 1
+}
+
+_port_for() {
+  local name="$1"
+  local hash
+  hash=$(echo -n "$name" | cksum | cut -d' ' -f1)
+  echo $((PORT_BASE + hash % 5000))
+}
+
+_do_mount() {
+  local host="$1" remote_path="$2" mount_point="$3" name="$4"
+  local cache_file="$CACHE_DIR/$name.json"
+  local rclone_bin
+  rclone_bin=$(_find_rclone_binary) || die "rclone not found"
+
+  local ssh_host ssh_user ssh_key
+  ssh_host=$(get_ssh_config "$host" "hostname")
+  ssh_user=$(get_ssh_config "$host" "user")
+  ssh_key=$(get_ssh_config "$host" "identityfile")
+  # Expand ~ in path (tilde doesn't expand in [ -f "~/" ])
+  ssh_key="${ssh_key/#\~/$HOME}"
+  [ -n "$ssh_host" ] || ssh_host="$host"
+  [ -n "$ssh_user" ] || ssh_user="$USER"
+
+  local webdav_port tunnel_port
+  webdav_port=$(_cache_value "$cache_file" webdav_port)
+  tunnel_port=$(_cache_value "$cache_file" tunnel_port)
+  [ -n "$webdav_port" ] || webdav_port=$(_port_for "$name")
+  [ -n "$tunnel_port" ] || tunnel_port=$((webdav_port + 5000))
+
+  echo "→ Mounting via WebDAV over SSH tunnel: $ssh_user@$ssh_host:$remote_path → $mount_point"
+  echo "  tunnel: 127.0.0.1:$tunnel_port → $host:22"
+  echo "  webdav: http://127.0.0.1:$webdav_port/"
+
+  _stop_services_for "$name"
+  diskutil unmount "$mount_point" 2>/dev/null || true
+  rmdir "$mount_point" 2>/dev/null || true
+  mkdir -p "$mount_point" "$CACHE_DIR"
+
+  ssh -fN \
+    -o ExitOnForwardFailure=yes \
+    -o ServerAliveInterval=30 \
+    -o ServerAliveCountMax=3 \
+    -L "${tunnel_port}:127.0.0.1:22" \
+    "$host" || die "SSH tunnel failed"
+
+  local tunnel_pid
+  tunnel_pid=$(_pid_listening_on_port "$tunnel_port")
+  [ -n "$tunnel_pid" ] && echo "$tunnel_pid" > "$CACHE_DIR/${name}.tunnel.pid"
+
+  local rclone_flags=(
+    --sftp-host=127.0.0.1
+    --sftp-user="$ssh_user"
+    --sftp-port="$tunnel_port"
+  )
+  if [ -n "$ssh_key" ] && [ -f "$ssh_key" ]; then
+    rclone_flags+=(--sftp-key-file="$ssh_key")
+  fi
+
+  "$rclone_bin" serve webdav ":sftp:$remote_path" \
+    --addr "127.0.0.1:$webdav_port" \
+    "${rclone_flags[@]}" \
+    --vfs-cache-mode writes \
+    --log-file "$CACHE_DIR/${name}.rclone.log" \
+    --log-level INFO &
+
+  local rclone_pid=$!
+  echo "$rclone_pid" > "$CACHE_DIR/${name}.pid"
+
+  if ! _wait_for_port "$webdav_port" "rclone webdav"; then
+    _stop_services_for "$name"
+    die "rclone WebDAV did not start; see $CACHE_DIR/${name}.rclone.log"
+  fi
+
+  if ! mount -t webdav "http://127.0.0.1:$webdav_port/" "$mount_point" 2>/dev/null; then
+    if ! mount_webdav "http://127.0.0.1:$webdav_port/" "$mount_point" 2>/dev/null; then
+      _stop_services_for "$name"
+      die "macOS WebDAV mount failed"
+    fi
+  fi
+
+  WEBDAV_PORT="$webdav_port"
+  TUNNEL_PORT="$tunnel_port"
+  RCLONE_PID="$rclone_pid"
+  TUNNEL_PID="$tunnel_pid"
+  echo "  Mounted via native WebDAV"
+}
+
+_stop_services_for() {
+  local name="$1"
+  local cache_file="$CACHE_DIR/$name.json"
+  local rclone_pid tunnel_pid webdav_port tunnel_port pids
+
+  rclone_pid=$(_cache_value "$cache_file" rclone_pid)
+  [ -n "$rclone_pid" ] || { [ -f "$CACHE_DIR/${name}.pid" ] && rclone_pid=$(cat "$CACHE_DIR/${name}.pid"); true; }
+  tunnel_pid=$(_cache_value "$cache_file" tunnel_pid)
+  [ -n "$tunnel_pid" ] || { [ -f "$CACHE_DIR/${name}.tunnel.pid" ] && tunnel_pid=$(cat "$CACHE_DIR/${name}.tunnel.pid"); true; }
+
+  [ -n "$rclone_pid" ] && kill "$rclone_pid" 2>/dev/null || true
+  [ -n "$tunnel_pid" ] && kill "$tunnel_pid" 2>/dev/null || true
+
+  webdav_port=$(_cache_value "$cache_file" webdav_port)
+  tunnel_port=$(_cache_value "$cache_file" tunnel_port)
+  if [ -n "$webdav_port" ]; then
+    pids=$(pgrep -f "rclone.*serve webdav.*127.0.0.1:$webdav_port" 2>/dev/null || true)
+    [ -n "$pids" ] && echo "$pids" | while read -r pid; do kill "$pid" 2>/dev/null || true; done
+  fi
+  if [ -n "$tunnel_port" ]; then
+    pids=$(pgrep -f "ssh.*${tunnel_port}:127.0.0.1:22" 2>/dev/null || true)
+    [ -n "$pids" ] && echo "$pids" | while read -r pid; do kill "$pid" 2>/dev/null || true; done
+  fi
+
+  rm -f "$CACHE_DIR/${name}.pid" "$CACHE_DIR/${name}.tunnel.pid"
+}
+
+# ─────────────────────────────────────────────────────────────
+# Subcommand: mount
+# ─────────────────────────────────────────────────────────────
+
+cmd_mount() {
+  if [ $# -lt 2 ]; then
+    echo "Usage: rmount-ctx mount <host> <remote-path> [name]"
+    exit 1
+  fi
+
+  local host="$1" remote_path="$2"
+  local name
+  if [ $# -ge 3 ]; then
+    name="$3"
+  else
+    name="${host}_$(basename "$remote_path" | sed 's/\./_/g')"
+  fi
+
+  local mount_point="$BASE_DIR/$name"
+  local cache_file="$CACHE_DIR/$name.json"
+
+  echo "=== rmount-ctx mount: $name ==="
+
+  # Idempotent: if already mounted, just refresh
+  if _is_mounted "$mount_point"; then
+    if [ ! -f "$cache_file" ]; then
+      die "$mount_point is already mounted but has no rmount-ctx cache; run 'rmount-ctx unmount $name' first"
+    fi
+    echo "Already mounted: $mount_point"
+    echo "Refreshing context..."
+    cmd_refresh_internal "$name"
+    return 0
+  fi
+
+  # Step 1: Perform mount
+  _do_mount "$host" "$remote_path" "$mount_point" "$name"
+
+  # Step 2: Collect remote info
+  echo "→ Collecting remote info from $host..."
+  local collected
+  collected=$(collect_remote_info "$host" "$remote_path" 2>/dev/null) || true
+
+  # Step 3: Save metadata cache
+  mkdir -p "$CACHE_DIR"
+  {
+    echo "host=$host"
+    echo "remote_path=$remote_path"
+    echo "mount_time=$TIMESTAMP"
+    echo "webdav_port=${WEBDAV_PORT:-}"
+    echo "tunnel_port=${TUNNEL_PORT:-}"
+    echo "rclone_pid=${RCLONE_PID:-}"
+    echo "tunnel_pid=${TUNNEL_PID:-}"
+    echo "$collected"
+    echo "last_refreshed=$TIMESTAMP"
+  } > "$cache_file"
+  echo "→ Metadata saved"
+
+  # Step 4: Generate context and inject
+  echo "→ Injecting context into CLAUDE.md and AGENTS.md..."
+  local context
+  context=$(generate_context_block "$name" "$host" "$remote_path")
+  for f in "$mount_point/CLAUDE.md" "$mount_point/AGENTS.md"; do
+    inject_context "$f" "$context"
+  done
+  echo "  + CLAUDE.md + AGENTS.md"
+
+  # Step 5: git exclude
+  add_to_git_exclude "$mount_point"
+
+  echo "=== Done: $mount_point ==="
+}
+
+# ─────────────────────────────────────────────────────────────
+# Internal refresh
+# ─────────────────────────────────────────────────────────────
+
+cmd_refresh_internal() {
+  local name="$1"
+  local cache_file="$CACHE_DIR/$name.json"
+  local mount_point="$BASE_DIR/$name"
+
+  if [ ! -f "$cache_file" ]; then
+    warn "No cache found for $name. Use 'rmount-ctx mount' first."
+    return 1
+  fi
+
+  local host remote_path
+  host=$(grep '^host=' "$cache_file" | cut -d= -f2-)
+  remote_path=$(grep '^remote_path=' "$cache_file" | cut -d= -f2-)
+
+  [ -n "$host" ] && [ -n "$remote_path" ] || die "Corrupt cache: $cache_file"
+
+  local collected
+  collected=$(collect_remote_info "$host" "$remote_path" 2>/dev/null) || true
+
+  local mount_time webdav_port tunnel_port rclone_pid tunnel_pid
+  mount_time=$(grep '^mount_time=' "$cache_file" | cut -d= -f2-)
+  webdav_port=$(_cache_value "$cache_file" webdav_port)
+  tunnel_port=$(_cache_value "$cache_file" tunnel_port)
+  rclone_pid=$(_cache_value "$cache_file" rclone_pid)
+  tunnel_pid=$(_cache_value "$cache_file" tunnel_pid)
+  {
+    echo "host=$host"
+    echo "remote_path=$remote_path"
+    echo "mount_time=${mount_time:-$TIMESTAMP}"
+    echo "webdav_port=$webdav_port"
+    echo "tunnel_port=$tunnel_port"
+    echo "rclone_pid=$rclone_pid"
+    echo "tunnel_pid=$tunnel_pid"
+    echo "$collected"
+    echo "last_refreshed=$TIMESTAMP"
+  } > "$cache_file"
+
+  if [ ! -d "$mount_point" ]; then
+    warn "Mount point gone: $mount_point — cache updated but files untouched"
+    return 0
+  fi
+
+  local context
+  context=$(generate_context_block "$name" "$host" "$remote_path")
+  for f in "$mount_point/CLAUDE.md" "$mount_point/AGENTS.md"; do
+    inject_context "$f" "$context"
+  done
+
+  echo "Refreshed: $name ($TIMESTAMP)"
+}
+
+cmd_refresh() {
+  [ $# -ge 1 ] || { echo "Usage: rmount-ctx refresh <name>"; exit 1; }
+  cmd_refresh_internal "$1"
+}
+
+# ─────────────────────────────────────────────────────────────
+# Subcommand: unmount
+# ─────────────────────────────────────────────────────────────
+
+cmd_unmount() {
+  [ $# -ge 1 ] || { echo "Usage: rmount-ctx unmount <name>"; exit 1; }
+
+  local name="$1"
+  local mount_point="$BASE_DIR/$name"
+  local cache_file="$CACHE_DIR/$name.json"
+
+  echo "=== rmount-ctx unmount: $name ==="
+
+  # Step 1: Remove marker blocks
+  if [ -d "$mount_point" ]; then
+    for f in "$mount_point/CLAUDE.md" "$mount_point/AGENTS.md"; do
+      if [ -f "$f" ] && grep -qF "$MARKER_BEGIN" "$f" 2>/dev/null; then
+        echo "→ Removing context from $(basename "$f")"
+        remove_marker_block "$f"
+      fi
+    done
+    remove_from_git_exclude "$mount_point"
+  fi
+
+  # Step 2: Unmount
+  if _is_mounted "$mount_point"; then
+    echo "→ Unmounting $mount_point"
+    diskutil unmount "$mount_point" 2>/dev/null || umount "$mount_point" 2>/dev/null || true
+    if _is_mounted "$mount_point"; then
+      "$HOME/bin/rumount" "$name" 2>/dev/null || diskutil unmount force "$mount_point" 2>/dev/null || umount -f "$mount_point" 2>/dev/null || true
+    fi
+    if _is_mounted "$mount_point"; then
+      die "Failed to unmount $mount_point; cache preserved"
+    fi
+  else
+    echo "→ Not mounted (skipping unmount)"
+  fi
+
+  # Step 3: Stop WebDAV and tunnel services
+  _stop_services_for "$name"
+
+  # Step 4: Remove cache
+  if [ -f "$cache_file" ]; then
+    rm -f "$cache_file"
+    echo "→ Removed cache"
+  fi
+
+  # Clean up empty mount dir
+  rmdir "$mount_point" 2>/dev/null || true
+
+  echo "=== Done ==="
+}
+
+# ─────────────────────────────────────────────────────────────
+# Subcommand: list
+# ─────────────────────────────────────────────────────────────
+
+cmd_list() {
+  echo "rmount-ctx managed mounts:"
+  echo "---"
+  if [ ! -d "$CACHE_DIR" ] || [ -z "$(ls -A "$CACHE_DIR"/*.json 2>/dev/null)" ]; then
+    echo "(none)"
+    return 0
+  fi
+  for json_file in "$CACHE_DIR"/*.json; do
+    [ -f "$json_file" ] || continue
+    local name host remote_path mount_time last_refreshed mount_status webdav_port
+    name=$(basename "$json_file" .json)
+    host=$(grep '^host=' "$json_file" | cut -d= -f2-)
+    remote_path=$(grep '^remote_path=' "$json_file" | cut -d= -f2-)
+    mount_time=$(grep '^mount_time=' "$json_file" | cut -d= -f2-)
+    last_refreshed=$(grep '^last_refreshed=' "$json_file" | cut -d= -f2-)
+    webdav_port=$(grep '^webdav_port=' "$json_file" | cut -d= -f2-)
+    if _is_mounted "$BASE_DIR/$name"; then
+      mount_status="[MOUNTED]"
+    elif [ -n "$webdav_port" ] && pgrep -f "rclone.*serve webdav.*127.0.0.1:$webdav_port" &>/dev/null; then
+      mount_status="[MOUNTED]"
+    else
+      mount_status="[STALE]"
+    fi
+    echo "$name $mount_status"
+    echo "  host:      $host"
+    echo "  remote:    $remote_path"
+    echo "  mounted:   ${mount_time:-?}"
+    echo "  refreshed: ${last_refreshed:-?}"
+    echo "  webdav:    ${webdav_port:-?}"
+  done
+}
+
+# ─────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────
+
+gc
+
+case "${1:-}" in
+  mount)   shift; cmd_mount "$@";;
+  unmount) shift; cmd_unmount "$@";;
+  refresh) shift; cmd_refresh "$@";;
+  list)    cmd_list;;
+  *)
+    cat <<'EOF'
+Usage: rmount-ctx <command> [args]
+
+Commands:
+  mount   <host> <remote-path> [name]   Mount + context injection
+  unmount <name>                        Unmount + cleanup
+  refresh <name>                        Re-collect remote info, update context
+  list                                  List all managed mounts
+
+EOF
+    exit 1
+    ;;
+esac

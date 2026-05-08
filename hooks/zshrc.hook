@@ -1,0 +1,10 @@
+# rmount-ctx: auto-refresh remote context on cd into remote_projects
+_chpwd_rmount_ctx() {
+  if [[ $PWD/ == $HOME/remote_projects/*/ ]]; then
+    local name=$(basename "$PWD")
+    if [[ -f "$HOME/.cache/rmount-ctx/${name}.json" ]]; then
+      $HOME/bin/rmount-ctx refresh "$name" &>/dev/null &|
+    fi
+  fi
+}
+chpwd_functions+=(_chpwd_rmount_ctx)
